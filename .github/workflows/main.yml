@@ -1,74 +1,59 @@
-
-name: RDP Setup and Software Installation
+name: RDP Setup and VirtualBox Installer + OVA Download
 
 on:
-  workflow_dispatch:  # Trigger manually
+  workflow_dispatch:
 
 jobs:
-  setup-rdp:
+  setup-rdp-and-vm:
     runs-on: windows-latest
-    timeout-minutes: 3600  # Set the maximum job time (6 hours)
+    timeout-minutes: 3600
 
     steps:
-
       - name: Checkout Repository
         uses: actions/checkout@v2
 
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-          # Open firewall for RDP on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-          # Restart the Remote Desktop service to ensure changes take effect
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
-      - name: Create RDP User with Fixed Password
+
+      - name: Create RDP User
         run: |
-          # Use a fixed RDP password as requested
           $password = 'Zain.rty123'
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          # Create the RDP user (if it already exists, update the password)
           if (Get-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue) {
-              # Set the password for existing user
               Set-LocalUser -Name "Administrator" -Password $securePass
           } else {
               New-LocalUser -Name "Administrator" -Password $securePass -AccountNeverExpires
           }
-          # Ensure group memberships
-          if (-not (Get-LocalGroupMember -Group "Administrators" -Member "Administrator" -ErrorAction SilentlyContinue)) {
-              Add-LocalGroupMember -Group "Administrators" -Member "Administrator"
-          }
-          if (-not (Get-LocalGroupMember -Group "Remote Desktop Users" -Member "Administrator" -ErrorAction SilentlyContinue)) {
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Administrator"
-          }
-          # Output the credentials to GitHub environment for later use
-          echo "RDP_CREDS=User: Administrator | Password: $password" >> $env:GITHUB_ENV
-          if (-not (Get-LocalUser -Name "Administrator")) {
-              Write-Error "User creation or update failed"
-              exit 1
-          }
+          Add-LocalGroupMember -Group "Administrators" -Member "Administrator" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Administrator" -ErrorAction SilentlyContinue
+          echo "RDP_CREDS=$password" >> $env:GITHUB_ENV
+
+      - name: Keep Administrator Session Active
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fResetBroken" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "IdleTimeout" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "MaxIdleTime" -Value 0
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name "InactivityTimeoutSecs" -Value 0
+          powercfg.exe /change monitor-timeout-ac 0
+          powercfg.exe /change standby-timeout-ac 0
+
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
           Remove-Item $installerPath -Force
+
       - name: Establish Tailscale Connection
         run: |
-          # Get the Tailscale Auth Key from GitHub Secrets
           $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
-          
-          # Log in to Tailscale using the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=gh-runner-$env:GITHUB_RUN_ID
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -81,62 +66,39 @@ jobs:
               exit 1
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
           Write-Host "TCP connectivity successful!"
-      - name: Download and Extract sOFTWARES
+
+      - name: Download VirtualBox and OVA Directly (No Keys)
         run: |
-          # Variables
-          $downloadUrl = "https://github.com/Zaiinalii/RDP/releases/download/v1/sOFTWARES.rar"
-          $downloadPath = Join-Path $env:TEMP "sOFTWARES.rar"
-          $extractPath = Join-Path $env:TEMP "sOFTWARES_extracted"
-          $desktopPath = Join-Path $env:USERPROFILE "Desktop"
-          try {
-            # Download the RAR
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing -ErrorAction Stop
-            # Ensure 7-Zip is installed (check both Program Files locations)
-            $sevenZipCandidates = @("C:\Program Files\7-Zip\7z.exe", "C:\Program Files (x86)\7-Zip\7z.exe")
-            $sevenZipExe = $sevenZipCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if (-not $sevenZipExe) {
-              choco install 7zip -y
-              # Re-evaluate path after install
-              $sevenZipExe = $sevenZipCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-            }
-            if (-not $sevenZipExe) {
-              Write-Error "7-Zip not found or failed to install."
-              exit 1
-            }
-            # Prepare extraction folder
-            if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue }
-            New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
-            # Extract the RAR (use 7z)
-            & "$sevenZipExe" x "$downloadPath" "-o$extractPath" -y
-            # Copy all extracted content (files and folders) to Desktop
-            # Use Get-ChildItem to ensure items are copied individually preserving folder structure
-            Get-ChildItem -Path $extractPath -Force | ForEach-Object {
-              $dest = Join-Path $desktopPath $_.Name
-              if ($_.PSIsContainer) {
-                Copy-Item -Path $_.FullName -Destination $dest -Recurse -Force -ErrorAction Stop
-              } else {
-                Copy-Item -Path $_.FullName -Destination $desktopPath -Force -ErrorAction Stop
-              }
-            }
-            # Clean up downloaded archive and temporary extraction folder
-            Remove-Item $downloadPath -Force -ErrorAction SilentlyContinue
-            Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Host "sOFTWARES downloaded, extracted, and all contents copied to Desktop."
-          } catch {
-            Write-Error "Failed to download/extract/copy sOFTWARES: $_"
-            exit 1
-          }
+          $dest = "C:\Users\Administrator\Desktop\Public"
+          if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest | Out-Null }
+
+          Write-Host "Downloading OVA..."
+          Invoke-WebRequest `
+            -Uri "https://pub-4e3db5ccea8a4f30ae7d4ee15e71f566.r2.dev/Nadeem.ova" `
+            -OutFile "$dest\Nadeem.ova" `
+            -UseBasicParsing
+
+          Write-Host "Downloading VirtualBox installer..."
+          Invoke-WebRequest `
+            -Uri "https://download.virtualbox.org/virtualbox/7.2.4/VirtualBox-7.2.4-170995-Win.exe" `
+            -OutFile "$dest\VirtualBox-7.2.4-170995-Win.exe" `
+            -UseBasicParsing
+
+      - name: Install VirtualBox Silently
+        run: |
+          $vbInstaller = "C:\Users\Administrator\Desktop\Public\VirtualBox-7.2.4-170995-Win.exe"
+          Start-Process -FilePath $vbInstaller -ArgumentList "--silent --msiparams ALLUSERS=2" -Wait
+
       - name: Maintain RDP Connection
         run: |
           Write-Host "`n=== RDP ACCESS ==="
@@ -144,7 +106,6 @@ jobs:
           Write-Host "Username: Administrator"
           Write-Host "Password: $env:RDP_CREDS"
           Write-Host "==================`n"
-          # Keep runner active indefinitely (or until manually canceled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C to terminate"
               Start-Sleep -Seconds 300
